@@ -23,6 +23,10 @@ func backgroundTypeTextStrict(_ args: [String: Value]) async throws -> CallTool.
     try await backgroundTypeTextStrictImpl(args)
 }
 
+func backgroundFocusFieldStrict(_ args: [String: Value]) async throws -> CallTool.Result {
+    try await backgroundFocusFieldStrictImpl(args)
+}
+
 func pressKey(_ args: [String: Value]) async throws -> CallTool.Result {
     try await pressKeyImpl(args)
 }

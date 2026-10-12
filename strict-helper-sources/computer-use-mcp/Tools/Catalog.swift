@@ -532,6 +532,22 @@ private let strictPIDOnlyToolCatalog: [ToolSpec] = {
             ),
             annotations: destructiveAppActionAnnotations,
             handler: { args in try await backgroundTypeTextStrict(args) }
+        ),
+        ToolSpec(
+            name: "background_focus_field_strict",
+            description: "Selects one exact AXTextField/AXTextArea in an inactive app using only AXFocusedAttribute. Requires exact PID, current snapshot element_id, and AXIdentifier. Never activates the app, posts input, moves the cursor, or falls back.",
+            inputSchema: objectSchema(
+                [
+                    "app": appParam,
+                    "target_pid": integerParam("Exact PID previously returned for the target app."),
+                    "element_id": elementIDParam,
+                    "ax_identifier": stringParam("Exact AXIdentifier of the target text field."),
+                    "confirm": confirmParam,
+                ],
+                required: ["app", "target_pid", "element_id", "ax_identifier"]
+            ),
+            annotations: nondestructiveAppActionAnnotations,
+            handler: { args in try await backgroundFocusFieldStrict(args) }
         )
     ]
 }()
