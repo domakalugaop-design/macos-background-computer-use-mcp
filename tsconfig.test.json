@@ -1,0 +1,21 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "outDir": "./dist-test",
+    "rootDir": ".",
+    "declaration": false,
+    "declarationMap": false,
+    "sourceMap": false
+  },
+  "include": [
+    "adapter-src/**/*.ts",
+    "adapter-tests/**/*.test.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist",
+    "dist-test",
+    "adapter-tests/automated-tests.ts",
+    "adapter-tests/debug-test.ts"
+  ]
+}

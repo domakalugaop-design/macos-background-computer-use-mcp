@@ -1,0 +1,320 @@
+#!/usr/bin/env node
+
+import { spawn, ChildProcess } from "node:child_process";
+import { resolve, dirname } from "node:path";
+import { access } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import {
+  CallToolRequestSchema,
+  ListToolsRequestSchema,
+  ErrorCode,
+  McpError,
+  Tool,
+} from "@modelcontextprotocol/sdk/types.js";
+import { SAFE_TOOLS, sanitizeToolSchema, upstreamArguments, validateToolArguments } from "./policy.js";
+
+const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const DEFAULT_HELPER = resolve(PACKAGE_ROOT, "bin", "computer-use-mcp");
+
+/** Resolve only an explicitly configured helper or the binary shipped beside this package. */
+export async function resolveHelperPath(explicit?: string): Promise<string> {
+  const candidate = explicit ?? process.env.BACKGROUND_COMPUTER_USE_HELPER ?? DEFAULT_HELPER;
+  try { await access(candidate); } catch {
+    throw new Error(`Computer Use helper not found at ${candidate}. Set BACKGROUND_COMPUTER_USE_HELPER to an existing trusted binary.`);
+  }
+  return candidate;
+}
+
+function upstreamEnvironment(): NodeJS.ProcessEnv {
+  // Do not pass API tokens and unrelated application secrets from the parent
+  // OpenCode process into the upstream helper. Keep only runtime essentials.
+  const env: NodeJS.ProcessEnv = { COMPUTER_USE_MCP_NO_TELEMETRY: "1" };
+  for (const key of ["HOME", "TMPDIR", "PATH", "LANG", "LC_ALL"]) {
+    const value = process.env[key];
+    if (value !== undefined) env[key] = value;
+  }
+  return env;
+}
+
+interface UpstreamTool {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+}
+
+interface PendingRequest {
+  resolve: (value: unknown) => void;
+  reject: (error: Error) => void;
+  timeout: NodeJS.Timeout;
+}
+
+export class BackgroundComputerUseAdapter {
+  constructor(private readonly upstreamBinary?: string, private readonly strictBinary?: string) {}
+
+  private upstream: ChildProcess | null = null;
+  private strictUpstream: ChildProcess | null = null;
+  private requestId = 0;
+  private strictRequestId = 0;
+  private stdoutBuffer = "";
+  private strictStdoutBuffer = "";
+  private pendingRequests = new Map<number, PendingRequest>();
+  private strictPendingRequests = new Map<number, PendingRequest>();
+
+  async start(): Promise<void> {
+    const upstreamBinary = await resolveHelperPath(this.upstreamBinary);
+    const strictBinary = await resolveHelperPath(this.strictBinary ?? process.env.BACKGROUND_COMPUTER_USE_STRICT_HELPER ?? upstreamBinary);
+    this.upstream = spawn(upstreamBinary, ["serve"], {
+      stdio: ["pipe", "pipe", "inherit"],
+      env: { ...upstreamEnvironment(), COMPUTER_USE_MCP_ENABLE_STRICT_PID_TEST: "1" },
+    });
+
+    this.upstream.stdout?.on("data", (data: Buffer) => {
+      this.handleUpstreamResponse(data);
+    });
+
+    this.upstream.on("error", (err) => {
+      console.error("[Adapter] Upstream process error:", err);
+    });
+
+    this.upstream.on("exit", (code) => {
+      console.error("[Adapter] Upstream exited with code:", code);
+      this.upstream = null;
+      for (const pending of this.pendingRequests.values()) {
+        clearTimeout(pending.timeout);
+        pending.reject(new Error("Upstream exited before returning a response."));
+      }
+      this.pendingRequests.clear();
+    });
+
+    // Wait for upstream to be ready
+    await this.waitForUpstreamReady();
+    this.strictUpstream = spawn(strictBinary, ["serve"], {
+      stdio: ["pipe", "pipe", "inherit"],
+      env: { ...upstreamEnvironment(), COMPUTER_USE_MCP_ENABLE_STRICT_PID_TEST: "1" },
+    });
+    this.strictUpstream.stdout?.on("data", (data: Buffer) => this.handleStrictUpstreamResponse(data));
+    this.strictUpstream.on("error", (err) => console.error("[Adapter] Strict upstream process error:", err));
+    this.strictUpstream.on("exit", () => {
+      this.strictUpstream = null;
+      for (const pending of this.strictPendingRequests.values()) {
+        clearTimeout(pending.timeout);
+        pending.reject(new Error("Strict upstream exited before returning a response."));
+      }
+      this.strictPendingRequests.clear();
+    });
+    await this.waitForStrictUpstreamReady();
+  }
+
+  private waitForUpstreamReady(): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("Upstream startup timeout")), 10000);
+      const checkReady = () => {
+        if (this.upstream && !this.upstream.killed) {
+          clearTimeout(timeout);
+          resolve();
+        } else {
+          setTimeout(checkReady, 100);
+        }
+      };
+      checkReady();
+    });
+  }
+
+  private waitForStrictUpstreamReady(): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("Strict upstream startup timeout")), 10000);
+      const checkReady = () => {
+        if (this.strictUpstream && !this.strictUpstream.killed) {
+          clearTimeout(timeout);
+          resolve();
+        } else setTimeout(checkReady, 100);
+      };
+      checkReady();
+    });
+  }
+
+  private handleUpstreamResponse(data: Buffer): void {
+    this.stdoutBuffer += data.toString("utf8");
+    const lines = this.stdoutBuffer.split("\n");
+    this.stdoutBuffer = lines.pop() ?? "";
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        const response = JSON.parse(line);
+        if (response.id !== undefined && this.pendingRequests.has(response.id)) {
+          const { resolve, reject, timeout } = this.pendingRequests.get(response.id)!;
+          clearTimeout(timeout);
+          this.pendingRequests.delete(response.id);
+          if (response.error) {
+            reject(new Error(response.error.message));
+          } else {
+            resolve(response.result);
+          }
+        }
+      } catch {
+        // Upstream output can contain accessibility text; never echo raw data
+        // into logs when a malformed response is received.
+        console.error("[Adapter] Failed to parse an upstream response line.");
+      }
+    }
+  }
+
+  private handleStrictUpstreamResponse(data: Buffer): void {
+    this.strictStdoutBuffer += data.toString("utf8");
+    const lines = this.strictStdoutBuffer.split("\n");
+    this.strictStdoutBuffer = lines.pop() ?? "";
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        const response = JSON.parse(line);
+        if (response.id !== undefined && this.strictPendingRequests.has(response.id)) {
+          const pending = this.strictPendingRequests.get(response.id)!;
+          clearTimeout(pending.timeout);
+          this.strictPendingRequests.delete(response.id);
+          if (response.error) pending.reject(new Error(response.error.message));
+          else pending.resolve(response.result);
+        }
+      } catch {
+        console.error("[Adapter] Failed to parse a strict upstream response line.");
+      }
+    }
+  }
+
+  private async callUpstream(method: string, params: Record<string, unknown> = {}): Promise<unknown> {
+    if (!this.upstream || this.upstream.killed) {
+      throw new Error("Upstream not running");
+    }
+
+    const id = ++this.requestId;
+    const request = { jsonrpc: "2.0", id, method, params };
+
+    return new Promise((resolve, reject) => {
+      // Timeout after 30 seconds
+      const timeout = setTimeout(() => {
+        if (this.pendingRequests.has(id)) {
+          this.pendingRequests.delete(id);
+          reject(new Error("Upstream request timeout"));
+        }
+      }, 30000);
+      this.pendingRequests.set(id, { resolve, reject, timeout });
+      this.upstream!.stdin!.write(JSON.stringify(request) + "\n");
+    });
+  }
+
+  private async callStrictUpstream(method: string, params: Record<string, unknown> = {}): Promise<unknown> {
+    if (!this.strictUpstream || this.strictUpstream.killed) throw new Error("Strict upstream not running");
+    const id = ++this.strictRequestId;
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        if (this.strictPendingRequests.has(id)) {
+          this.strictPendingRequests.delete(id);
+          reject(new Error("Strict upstream request timeout"));
+        }
+      }, 30000);
+      this.strictPendingRequests.set(id, { resolve, reject, timeout });
+      this.strictUpstream!.stdin!.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+    });
+  }
+
+  async listTools(): Promise<Tool[]> {
+    const result = await this.callUpstream("tools/list") as { tools: Tool[] };
+    const strictResult = await this.callStrictUpstream("tools/list") as { tools: Tool[] };
+    const strictOnly = strictResult.tools.filter((tool) => tool.name === "background_type_text_strict");
+    const seen = new Set<string>();
+    return [...result.tools, ...strictOnly].filter((tool) => {
+      if (seen.has(tool.name)) return false;
+      seen.add(tool.name);
+      return true;
+    }).flatMap((tool) => {
+      const sanitized = sanitizeToolSchema(tool);
+      return sanitized ? [sanitized] : [];
+    });
+  }
+
+  async callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
+    const validation = validateToolArguments(name, args);
+    if (validation.error) {
+      const code = SAFE_TOOLS.has(name) ? ErrorCode.InvalidParams : ErrorCode.MethodNotFound;
+      throw new McpError(code, validation.error);
+    }
+    const target = name === "background_type_text_strict" ? this.callStrictUpstream.bind(this) : this.callUpstream.bind(this);
+    return target("tools/call", {
+      name,
+      arguments: upstreamArguments(name, validation.args ?? {}),
+    });
+  }
+
+  async shutdown(): Promise<void> {
+    const upstream = this.upstream;
+    if (!upstream || upstream.killed) return;
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      let timeout: NodeJS.Timeout;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        resolve();
+      };
+      upstream.once("exit", finish);
+      timeout = setTimeout(() => {
+        if (!upstream.killed) upstream.kill("SIGKILL");
+        finish();
+      }, 2000);
+      upstream.kill("SIGTERM");
+    });
+    if (this.strictUpstream && !this.strictUpstream.killed) this.strictUpstream.kill("SIGTERM");
+  }
+}
+
+export function createAdapterServer(adapter: BackgroundComputerUseAdapter): Server {
+  const server = new Server(
+    { name: "background-computer-use-adapter", version: "1.0.0" },
+    { capabilities: { tools: {} } },
+  );
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: await adapter.listTools() }));
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const { name, arguments: args } = request.params;
+    try {
+      const result = await adapter.callTool(name, args as Record<string, unknown>);
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
+    } catch (error) {
+      if (error instanceof McpError) throw error;
+      throw new McpError(ErrorCode.InternalError, `Tool call failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  });
+  return server;
+}
+
+async function main() {
+  const adapter = new BackgroundComputerUseAdapter();
+  try {
+    await adapter.start();
+    const server = createAdapterServer(adapter);
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+    console.error("[Adapter] Background Computer Use Adapter started");
+
+    process.on("SIGINT", async () => {
+      console.error("[Adapter] Shutting down...");
+      await adapter.shutdown();
+      process.exit(0);
+    });
+
+    process.on("SIGTERM", async () => {
+      console.error("[Adapter] Shutting down...");
+      await adapter.shutdown();
+      process.exit(0);
+    });
+  } catch (error) {
+    console.error("[Adapter] Fatal error:", error);
+    await adapter.shutdown();
+    process.exit(1);
+  }
+}
+
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  void main();
+}
