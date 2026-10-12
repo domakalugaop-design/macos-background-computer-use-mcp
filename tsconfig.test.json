@@ -7,6 +7,15 @@
     "declarationMap": false,
     "sourceMap": false
   },
-  "include": ["src/**/*.ts", "tests/**/*.test.ts"],
-  "exclude": ["node_modules", "dist", "dist-test", "tests/automated-tests.ts", "tests/debug-test.ts"]
+  "include": [
+    "adapter-src/**/*.ts",
+    "adapter-tests/**/*.test.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist",
+    "dist-test",
+    "adapter-tests/automated-tests.ts",
+    "adapter-tests/debug-test.ts"
+  ]
 }

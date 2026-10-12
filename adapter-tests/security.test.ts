@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
-import { SAFE_TOOLS, sanitizeToolSchema, upstreamArguments, validateToolArguments } from "../src/policy.js";
+import { SAFE_TOOLS, sanitizeToolSchema, upstreamArguments, validateToolArguments } from "../adapter-src/policy.js";
 
 test("only inspection, AXPress, bounded AX value setting, and non-probing health are allowlisted", () => {
   assert.deepEqual([...SAFE_TOOLS].sort(), [
@@ -95,4 +95,9 @@ test("adapter forces no screenshots, no state echo after write, and no capture h
     app: "Finder", element_id: "e12@s3",
   });
   assert.deepEqual(upstreamArguments("health_report", {}), { probe_capture_service: false });
+});
+
+test("helper resolution rejects missing paths without downloading or falling back", async () => {
+  const { resolveHelperPath } = await import("../adapter-src/index.js");
+  await assert.rejects(resolveHelperPath("/definitely/missing/computer-use-mcp"), /helper not found/);
 });

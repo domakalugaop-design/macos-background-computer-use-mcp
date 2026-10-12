@@ -2,8 +2,8 @@
 
 import { spawn, ChildProcess } from "node:child_process";
 
-const ADAPTER_PATH = "/Users/artemgavrilenko/Development/background-computer-use-adapter/dist/index.js";
-const UPSTREAM_BINARY = "/Users/artemgavrilenko/Development/background-computer-use-adapter/computer-use-mcp";
+const ADAPTER_PATH = process.env.ADAPTER_PATH ?? "./dist/index.js";
+const UPSTREAM_BINARY = process.env.UPSTREAM_BINARY ?? "./bin/computer-use-mcp";
 
 interface TestResult {
   name: string;

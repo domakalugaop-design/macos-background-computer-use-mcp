@@ -1,0 +1,17 @@
+name: Release candidate (manual)
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        required: true
+        description: Existing tag to build; publishing is intentionally not automated.
+jobs:
+  build-only:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: ${{ inputs.tag }}}
+      - uses: actions/setup-node@v4
+        with: {node-version: 20}
+      - run: npm ci && npm run build
+      - run: swift build --product computer-use-mcp -c release

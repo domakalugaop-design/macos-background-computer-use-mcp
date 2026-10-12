@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { afterEach, test } from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { BackgroundComputerUseAdapter, createAdapterServer } from "../src/index.js";
+import { BackgroundComputerUseAdapter, createAdapterServer } from "../adapter-src/index.js";
 
 const temporaryDirs: string[] = [];
 afterEach(async () => {
@@ -19,7 +19,7 @@ test("stdio MCP exposes only the sanitized tools and rejects unsafe calls before
   const fixture = join(directory, "mock-upstream.mjs");
   await writeFile(fixture, `#!/usr/bin/env node
 let buffer = "";
-const names = ["list_apps","list_windows","get_app_state","click","type_text","press_key","scroll","drag","set_value","select_text","perform_secondary_action","open_app","open_url","manage_window","read_clipboard","write_clipboard","health_report"];
+const names = ["list_apps","list_windows","get_app_state","click","type_text","press_key","scroll","drag","set_value","select_text","perform_secondary_action","open_app","open_url","manage_window","read_clipboard","write_clipboard","health_report","background_type_text_strict"];
 for await (const chunk of process.stdin) {
   buffer += chunk.toString();
   let newline;

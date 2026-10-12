@@ -17,18 +17,18 @@ let package = Package(
             dependencies: [
                 .product(name: "MCP", package: "swift-sdk")
             ],
-            path: "Sources/computer-use-mcp"
+            path: "strict-helper-sources/computer-use-mcp"
         ),
         // Deterministic GUI fixture app for the end-to-end "truth suite".
         // See docs/fixture-app.md.
         .executableTarget(
             name: "ComputerUseFixture",
-            path: "Sources/ComputerUseFixture"
+            path: "strict-helper-sources/ComputerUseFixture"
         ),
         .testTarget(
             name: "ComputerUseMCPTests",
             dependencies: ["computer-use-mcp"],
-            path: "Tests/ComputerUseMCPTests"
+            path: "strict-helper-tests/ComputerUseMCPTests"
         ),
     ]
 )

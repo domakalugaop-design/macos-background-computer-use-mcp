@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 
 import { spawn, ChildProcess } from "node:child_process";
-import { resolve } from "node:path";
+import { resolve, dirname } from "node:path";
+import { access } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -14,8 +15,17 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { SAFE_TOOLS, sanitizeToolSchema, upstreamArguments, validateToolArguments } from "./policy.js";
 
-const UPSTREAM_BINARY = fileURLToPath(new URL("../computer-use-mcp-background-axpress-v2", import.meta.url));
-const STRICT_BINARY = "/Users/artemgavrilenko/Development/computer-use-mcp-p4-strict-pid/.build/debug/computer-use-mcp";
+const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const DEFAULT_HELPER = resolve(PACKAGE_ROOT, "bin", "computer-use-mcp");
+
+/** Resolve only an explicitly configured helper or the binary shipped beside this package. */
+export async function resolveHelperPath(explicit?: string): Promise<string> {
+  const candidate = explicit ?? process.env.BACKGROUND_COMPUTER_USE_HELPER ?? DEFAULT_HELPER;
+  try { await access(candidate); } catch {
+    throw new Error(`Computer Use helper not found at ${candidate}. Set BACKGROUND_COMPUTER_USE_HELPER to an existing trusted binary.`);
+  }
+  return candidate;
+}
 
 function upstreamEnvironment(): NodeJS.ProcessEnv {
   // Do not pass API tokens and unrelated application secrets from the parent
@@ -41,7 +51,7 @@ interface PendingRequest {
 }
 
 export class BackgroundComputerUseAdapter {
-  constructor(private readonly upstreamBinary = UPSTREAM_BINARY) {}
+  constructor(private readonly upstreamBinary?: string, private readonly strictBinary?: string) {}
 
   private upstream: ChildProcess | null = null;
   private strictUpstream: ChildProcess | null = null;
@@ -53,9 +63,11 @@ export class BackgroundComputerUseAdapter {
   private strictPendingRequests = new Map<number, PendingRequest>();
 
   async start(): Promise<void> {
-    this.upstream = spawn(this.upstreamBinary, ["serve"], {
+    const upstreamBinary = await resolveHelperPath(this.upstreamBinary);
+    const strictBinary = await resolveHelperPath(this.strictBinary ?? process.env.BACKGROUND_COMPUTER_USE_STRICT_HELPER ?? upstreamBinary);
+    this.upstream = spawn(upstreamBinary, ["serve"], {
       stdio: ["pipe", "pipe", "inherit"],
-      env: upstreamEnvironment(),
+      env: { ...upstreamEnvironment(), COMPUTER_USE_MCP_ENABLE_STRICT_PID_TEST: "1" },
     });
 
     this.upstream.stdout?.on("data", (data: Buffer) => {
@@ -78,7 +90,7 @@ export class BackgroundComputerUseAdapter {
 
     // Wait for upstream to be ready
     await this.waitForUpstreamReady();
-    this.strictUpstream = spawn(STRICT_BINARY, ["serve"], {
+    this.strictUpstream = spawn(strictBinary, ["serve"], {
       stdio: ["pipe", "pipe", "inherit"],
       env: { ...upstreamEnvironment(), COMPUTER_USE_MCP_ENABLE_STRICT_PID_TEST: "1" },
     });
@@ -210,7 +222,12 @@ export class BackgroundComputerUseAdapter {
     const result = await this.callUpstream("tools/list") as { tools: Tool[] };
     const strictResult = await this.callStrictUpstream("tools/list") as { tools: Tool[] };
     const strictOnly = strictResult.tools.filter((tool) => tool.name === "background_type_text_strict");
-    return [...result.tools, ...strictOnly].flatMap((tool) => {
+    const seen = new Set<string>();
+    return [...result.tools, ...strictOnly].filter((tool) => {
+      if (seen.has(tool.name)) return false;
+      seen.add(tool.name);
+      return true;
+    }).flatMap((tool) => {
       const sanitized = sanitizeToolSchema(tool);
       return sanitized ? [sanitized] : [];
     });
