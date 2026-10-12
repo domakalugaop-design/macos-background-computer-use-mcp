@@ -13,5 +13,6 @@ jobs:
         with: {ref: ${{ inputs.tag }}}
       - uses: actions/setup-node@v4
         with: {node-version: 20}
-      - run: npm ci && npm run build
       - run: swift build --product computer-use-mcp -c release
+      - run: mkdir -p bin && cp .build/release/computer-use-mcp bin/computer-use-mcp
+      - run: npm ci && npm run build
