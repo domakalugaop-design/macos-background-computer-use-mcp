@@ -7,7 +7,7 @@ on:
         description: Existing tag to build; publishing is intentionally not automated.
 jobs:
   build-only:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
         with: {ref: ${{ inputs.tag }}}
