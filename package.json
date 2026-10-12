@@ -1,0 +1,22 @@
+{
+  "name": "background-computer-use-adapter",
+  "version": "1.0.0",
+  "description": "Background-only MCP adapter for macOS computer use - strict allowlist wrapper around computer-use-mcp",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "test": "npm run build && tsc -p tsconfig.test.json && node --test dist-test/tests/*.test.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "@types/node": "^20.0.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

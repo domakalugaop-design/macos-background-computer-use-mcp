@@ -1,0 +1,577 @@
+// Text and value manipulation via the accessibility API: type_text,
+// set_value, select_text, perform_secondary_action.
+
+import ApplicationServices
+import CoreGraphics
+import Foundation
+import MCP
+
+// MARK: - type_text
+
+func backgroundTypeTextStrictImpl(_ args: [String: Value]) async throws -> CallTool.Result {
+    let app = try resolveApp(args.requireString("app"))
+    try requireAccessibilityTrusted()
+    let expectedPID = try args.requireNumber("target_pid")
+    guard expectedPID.isFinite, expectedPID.rounded() == expectedPID,
+        expectedPID >= 1, expectedPID <= Double(Int32.max), Int32(expectedPID) == app.pid
+    else {
+        return .text("BLOCKED: target PID does not match the currently resolved app.", isError: true)
+    }
+    let text = try args.requireString("text")
+    try validateTypeTextArgument(text)
+    guard text.count <= 80 else {
+        throw ToolError.invalidArguments("P4 strict text is limited to 80 characters.")
+    }
+    let confirmed = SafetyPolicy.confirmed(args)
+    try SafetyPolicy.check(app: app, confirmed: confirmed)
+    let target = try await resolveMutationTarget(app: app, elementID: args.requireString("element_id"))
+    try SafetyPolicy.checkTyping(into: target.element, app: app, confirmed: confirmed)
+
+    var ownerPID = pid_t(0)
+    let ownerError = AXUIElementGetPid(target.element, &ownerPID)
+    guard ownerError == .success, ownerPID == app.pid, ownerPID == Int32(expectedPID) else {
+        return .text("BLOCKED: AX element ownership did not match the exact target PID.", isError: true)
+    }
+    let focused = axElement(app.axApplication, kAXFocusedUIElementAttribute)
+    guard let focused, CFEqual(focused, target.element) else {
+        return .text("BLOCKED: target AX element is not already AXFocusedUIElement; no event was sent.", isError: true)
+    }
+    let foregroundBefore = FrontmostAppSnapshot.current()
+    guard let foregroundBefore, foregroundBefore.pid != app.pid else {
+        return .text("BLOCKED: target app is foreground or foreground identity is unavailable; no event was sent.", isError: true)
+    }
+    let cursorBefore = CGEvent(source: nil)?.location
+    let valueBefore = axString(target.element, kAXValueAttribute)
+
+    let tier = try typeUnicodeTextPerPidOnly(text, pid: app.pid)
+
+    let foregroundAfter = FrontmostAppSnapshot.current()
+    let cursorAfter = CGEvent(source: nil)?.location
+    let valueAfter = axString(target.element, kAXValueAttribute)
+    let output: [String: Any] = [
+        "status": "EVENT_SENT",
+        "delivery_tier": tier.rawValue,
+        "target_pid": Int(app.pid),
+        "target_element_id": target.snapshotElement.id,
+        "target_focused_before_send": true,
+        "foreground_before_pid": Int(foregroundBefore.pid),
+        "foreground_after_pid": Int(foregroundAfter?.pid ?? -1),
+        "foreground_preserved": foregroundBefore == foregroundAfter,
+        "cursor_before": cursorBefore.map { [Double($0.x), Double($0.y)] } ?? [],
+        "cursor_after": cursorAfter.map { [Double($0.x), Double($0.y)] } ?? [],
+        "cursor_preserved": cursorBefore == cursorAfter,
+        "ax_value_before": valueBefore ?? "<unavailable>",
+        "ax_value_after": valueAfter ?? "<unavailable>",
+        "global_input_used": false,
+        "fallback_used": false,
+    ]
+    let data = try JSONSerialization.data(withJSONObject: output, options: [.sortedKeys])
+    return .text(String(decoding: data, as: UTF8.self))
+}
+
+func typeTextImpl(_ args: [String: Value]) async throws -> CallTool.Result {
+    let app = try resolveApp(args.requireString("app"))
+    try requireAccessibilityTrusted()
+    let text = try args.requireString("text")
+    try validateTypeTextArgument(text)
+    try ArgumentBounds.checkStringLength(text, argument: "text", maximum: ArgumentBounds.maxTypeTextCharacters)
+    let confirmed = SafetyPolicy.confirmed(args)
+    try SafetyPolicy.check(app: app, confirmed: confirmed)
+    let focus = FocusChangeTracker.start()
+
+    let element: AXUIElement
+    let described: String
+    let snapshotElement: CapturedNode?
+    let windowTitle: String?
+    let actedWindowID: CGWindowID?
+    let actedWindowElement: AXUIElement
+    if let elementID = args.string("element_id") {
+        let target = try await resolveMutationTarget(app: app, elementID: elementID)
+        element = target.element
+        described = describeTarget(target)
+        snapshotElement = target.snapshotElement
+        windowTitle = target.snapshot.windowTitle
+        actedWindowID = target.window.lineageWindowID
+        actedWindowElement = target.window.element
+    } else {
+        let window = try targetWindow(for: app, title: nil)
+        guard let windowID = window.lineageWindowID else {
+            throw ToolError.failed(
+                "Could not establish the target window identity for \(app.name). Call get_app_state and retry.")
+        }
+        guard let focused = axElement(app.axApplication, kAXFocusedUIElementAttribute) else {
+            throw ToolError.failed(
+                "\(app.name) has no focused element. Pass element_id for the field to type into."
+            )
+        }
+        element = focused
+        described = "the focused element (\(axRole(focused)))"
+        snapshotElement = nil
+        windowTitle = window.title
+        actedWindowID = windowID
+        actedWindowElement = window.element
+    }
+
+    try SafetyPolicy.checkTyping(into: element, app: app, confirmed: confirmed)
+    let verifyEffect = args.bool("include_state") != false
+    let deliveryObserver = verifyEffect ? AXDeliveryObserver(
+        pid: app.pid, application: app.axApplication, window: actedWindowElement,
+        target: element, family: .type) : nil
+    let deliveryRevision = deliveryObserver?.revision
+    // Read (before): capture the field's value before the insertion.
+    let before = ActionVerifier.captureBefore(element, family: .type, snapshotElement: snapshotElement)
+    let tier = try await insertText(
+        text, into: element, app: app, described: described,
+        observer: deliveryObserver)
+    let intent = ActionIntent.insertText(text)
+    let predicate: () async -> Bool = {
+        if let snapshotElement {
+            return await retainedTargetSatisfies(
+                snapshotElement: snapshotElement, window: actedWindowElement,
+                family: .type, intent: intent, before: before)
+        }
+        var after = before
+        after.captureAfter(element, family: .type)
+        return intent.satisfiedByAfter(after).satisfied
+    }
+    if verifyEffect {
+        await waitForDeliveryVerification(
+            observer: deliveryObserver, baselineRevision: deliveryRevision,
+            predicate: predicate)
+    }
+    let warning = readBackWarning(typed: text, element: element)
+    let verifier = ActionVerifier(
+        family: .type, intent: intent, deliveryTier: tier.rawValue,
+        dispatchSucceeded: true, hasTargetElement: snapshotElement != nil,
+        snapshotElement: snapshotElement, before: before, beforeWindowTitle: windowTitle)
+    return try await stateResult(
+        app: app, windowTitle: windowTitle, windowID: actedWindowID,
+        note: "Typed \(text.count) characters into \(described). "
+            + (warning ?? "Verify the new value below."),
+        screenshot: screenshotDetail(args),
+        focusTelemetry: focus.finish(deliveryTier: tier.rawValue),
+        verifier: verifier
+    )
+}
+
+func validateTypeTextArgument(_ text: String) throws {
+    guard !text.isEmpty else {
+        throw ToolError.invalidArguments(
+            "\"text\" must not be empty; use set_value to clear a field.")
+    }
+}
+
+/// Read the element's value back after insertion and verify the typed text
+/// actually landed — some apps report success for the AX write and then
+/// ignore it. Skipped for secure fields (never echo), long texts, and huge
+/// documents where the full-value read would be expensive.
+private func readBackWarning(typed: String, element: AXUIElement) -> String? {
+    guard axString(element, kAXSubroleAttribute) != (kAXSecureTextFieldSubrole as String) else { return nil }
+    if let count = (axAttribute(element, "AXNumberOfCharacters") as? NSNumber)?.intValue,
+        count > 200_000
+    {
+        return nil
+    }
+    return typedTextWarning(typed: typed, currentValue: axString(element, kAXValueAttribute))
+}
+
+/// Pure part of the read-back check, separated for tests. nil when the typed
+/// text is present or verification is not feasible.
+func typedTextWarning(typed: String, currentValue: String?) -> String? {
+    guard typed.count <= 500, !typed.isEmpty, let currentValue else { return nil }
+    guard !currentValue.contains(typed) else { return nil }
+    return
+        "Warning: the element's value does not contain the typed text after insertion — "
+        + "the app may have ignored or transformed the input. Inspect the state below "
+        + "before proceeding."
+}
+
+/// Insert text at the element's current selection (collapsed selection =
+/// caret). Prefers the canonical kAXSelectedText replacement, then splicing the
+/// full value; if the element accepts neither (custom/web fields), falls back
+/// to background-safe synthetic Unicode key events. Returns the tier used.
+private func insertText(
+    _ text: String, into element: AXUIElement, app: ResolvedApp, described: String,
+    observer: AXDeliveryObserver?
+) async throws -> InputTier {
+
+    let selectedTextSettable = try axAttributeIsSettable(
+        element, kAXSelectedTextAttribute as String)
+    let valueSettable = selectedTextSettable
+        ? false
+        : try axAttributeIsSettable(element, kAXValueAttribute as String)
+    switch textDeliveryRoute(
+        selectedTextSettable: selectedTextSettable,
+        valueSettable: valueSettable)
+    {
+    case .selectedText:
+        try checkCancellationBeforeDelivery()
+        let error = AXUIElementSetAttributeValue(
+            element, kAXSelectedTextAttribute as CFString, text as CFString)
+        guard error == .success else {
+            throw ToolError.failed(
+                "Could not replace the selected text in \(described) (\(axErrorDescription(error))).")
+        }
+        return .accessibilityAttribute
+
+    case .synthetic:
+        // The element exposes no settable AX value. Focus it and prove the
+        // synthetic keys land here, then type through Unicode key events posted
+        // to the pid — same background-safe, pid-targeted discipline as the
+        // click ladder, never a global post. The secure-field gate already ran
+        // in typeTextImpl, so this path stays behind that confirmation.
+        try checkCancellationBeforeDelivery()
+        func ownsFocus() -> Bool {
+            guard let current = axElement(app.axApplication, kAXFocusedUIElementAttribute) else {
+                return false
+            }
+            return CFEqual(current, element)
+        }
+        let focusRevision = observer?.revision
+        if !ownsFocus() {
+            let focusError = AXUIElementSetAttributeValue(
+                element, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+            guard focusError == .success else {
+                throw ToolError.failed(
+                    "Could not focus \(described) before synthetic typing "
+                        + "(\(axErrorDescription(focusError))).")
+            }
+        }
+        let focused = await waitForDeliveryVerification(
+            observer: observer, baselineRevision: focusRevision,
+            predicate: { ownsFocus() })
+        guard focused else {
+            throw ToolError.failed(
+                "Could not prove that \(described) received focus; no synthetic text was posted.")
+        }
+        let context = DeliveryContext(pid: app.pid, windowNumber: nil, windowFrame: nil, allowGlobalCursor: false)
+        return try typeUnicodeText(text, context: context)
+
+    case .valueSplice:
+        let current = axString(element, kAXValueAttribute) ?? ""
+        let nsCurrent = current as NSString
+        var range = CFRange(location: nsCurrent.length, length: 0)
+        if let rangeValue = axAttribute(element, kAXSelectedTextRangeAttribute),
+            CFGetTypeID(rangeValue) == AXValueGetTypeID()
+        {
+            AXValueGetValue(rangeValue as! AXValue, .cfRange, &range)
+        }
+        let start = max(0, min(range.location, nsCurrent.length))
+        let length = max(0, min(range.length, nsCurrent.length - start))
+        let updated = nsCurrent.replacingCharacters(
+            in: NSRange(location: start, length: length), with: text)
+
+        try checkCancellationBeforeDelivery()
+        let error = AXUIElementSetAttributeValue(
+            element, kAXValueAttribute as CFString, updated as CFString)
+        guard error == .success else {
+            throw ToolError.failed(
+                "Could not set the value of \(described) (\(axErrorDescription(error))).")
+        }
+
+        // Caret placement is best-effort bookkeeping after the single text
+        // delivery; failure cannot trigger another insertion route.
+        var caret = CFRange(location: start + (text as NSString).length, length: 0)
+        if let caretValue = AXValueCreate(.cfRange, &caret) {
+            AXUIElementSetAttributeValue(
+                element, kAXSelectedTextRangeAttribute as CFString, caretValue)
+        }
+        return .accessibilityAttribute
+    }
+}
+
+/// Capability selection happens before delivery. Unsupported attributes permit
+/// another route; transport/runtime errors fail instead of silently changing
+/// delivery methods.
+func axAttributeIsSettable(_ element: AXUIElement, _ attribute: String) throws -> Bool {
+    var settable = DarwinBoolean(false)
+    let error = AXUIElementIsAttributeSettable(element, attribute as CFString, &settable)
+    switch error {
+    case .success:
+        return settable.boolValue
+    case .attributeUnsupported, .noValue, .notImplemented:
+        return false
+    default:
+        throw ToolError.failed(
+            "Could not determine whether \(attribute) is writable (\(axErrorDescription(error))).")
+    }
+}
+
+// MARK: - set_value
+
+func setValueImpl(_ args: [String: Value]) async throws -> CallTool.Result {
+    let app = try resolveApp(args.requireString("app"))
+    try requireAccessibilityTrusted()
+    let confirmed = SafetyPolicy.confirmed(args)
+    try SafetyPolicy.check(app: app, confirmed: confirmed)
+    let focus = FocusChangeTracker.start()
+    let target = try await resolveMutationTarget(app: app, elementID: args.requireString("element_id"))
+    try SafetyPolicy.checkTyping(into: target.element, app: app, confirmed: confirmed)
+    // An empty value is valid (clearing a field), so accept "" rather than
+    // treating it as a missing argument.
+    guard let value = args.string("value") else {
+        throw ToolError.invalidArguments("\"value\" (string) is required.")
+    }
+    try ArgumentBounds.checkStringLength(value, argument: "value", maximum: ArgumentBounds.maxSetValueCharacters)
+    try SafetyPolicy.checkValueChange(
+        currentValue: axString(target.element, kAXValueAttribute), newValue: value, app: app, confirmed: confirmed
+    )
+
+    let verifyEffect = args.bool("include_state") != false
+    let deliveryObserver = verifyEffect ? AXDeliveryObserver(
+        pid: app.pid, application: app.axApplication, window: target.window.element,
+        target: target.element, family: .setValue) : nil
+    let deliveryRevision = deliveryObserver?.revision
+    // Read (before): capture the target's fields before dispatch.
+    let before = ActionVerifier.captureBefore(
+        target.element, family: .setValue, snapshotElement: target.snapshotElement)
+    let windowTitle = target.snapshot.windowTitle
+    func verifier(
+        intent: ActionIntent, tier: InputTier, dispatched: Bool, resolved: ActionOutcome? = nil
+    ) -> ActionVerifier {
+        ActionVerifier(
+            family: .setValue, intent: intent, deliveryTier: tier.rawValue, dispatchSucceeded: dispatched,
+            hasTargetElement: true, snapshotElement: target.snapshotElement, before: before,
+            beforeWindowTitle: windowTitle, resolved: resolved)
+    }
+
+    guard try axAttributeIsSettable(target.element, kAXValueAttribute as String) else {
+        // No settable value: retrying won't help — classify unsupported rather
+        // than throw (isError stays false, the agent learns to switch tools).
+        return try await stateResult(
+            app: app, windowTitle: windowTitle, windowID: target.window.lineageWindowID,
+            note: "\(describeTarget(target)) does not accept a direct value; nothing was set.",
+            screenshot: screenshotDetail(args),
+            focusTelemetry: focus.finish(deliveryTier: InputTier.accessibilityAttribute.rawValue),
+            verifier: verifier(
+                intent: .setText(value), tier: .accessibilityAttribute, dispatched: false,
+                resolved: .unsupported(
+                    .unsupported,
+                    "\(describeTarget(target)) does not accept a direct value. Use click/type_text, "
+                        + "or check the element's actions in get_app_state."))
+        )
+    }
+
+    // Numeric elements (sliders, steppers) want numbers, not strings. A
+    // non-numeric string into a numeric field is a coercion failure — do not
+    // send it (today's code silently would).
+    let currentValue = axAttribute(target.element, kAXValueAttribute)
+    let isNumeric = currentValue.map { CFGetTypeID($0) == CFNumberGetTypeID() } ?? false
+    let newValue: CFTypeRef
+    let intent: ActionIntent
+    if isNumeric {
+        guard let number = Double(value) else {
+            return try await stateResult(
+                app: app, windowTitle: windowTitle, windowID: target.window.lineageWindowID,
+                note: "\(describeTarget(target)) takes a number; \"\(value)\" is not numeric and was not applied.",
+                screenshot: screenshotDetail(args),
+                focusTelemetry: focus.finish(deliveryTier: InputTier.accessibilityAttribute.rawValue),
+                verifier: verifier(
+                    intent: .setText(value), tier: .accessibilityAttribute, dispatched: false,
+                    resolved: .unsupported(
+                        .coercion,
+                        "\(describeTarget(target)) takes a number; \"\(value)\" is not numeric."))
+            )
+        }
+        newValue = NSNumber(value: number)
+        intent = .setNumber(number)
+    } else {
+        newValue = value as CFString
+        intent = .setText(value)
+    }
+
+    if intent.alreadySatisfied(by: before) {
+        return try await stateResult(
+            app: app, windowTitle: windowTitle, windowID: target.window.lineageWindowID,
+            note: "The value of \(describeTarget(target)) already matches the request.",
+            screenshot: screenshotDetail(args),
+            focusTelemetry: focus.finish(deliveryTier: InputTier.accessibilityAttribute.rawValue),
+            verifier: verifier(intent: intent, tier: .accessibilityAttribute, dispatched: false)
+        )
+    }
+
+    try checkCancellationBeforeDelivery()
+    guard AXUIElementSetAttributeValue(target.element, kAXValueAttribute as CFString, newValue) == .success
+    else {
+        throw ToolError.failed("Setting the value of \(describeTarget(target)) failed.")
+    }
+    if verifyEffect {
+        await waitForDeliveryVerification(
+            observer: deliveryObserver, baselineRevision: deliveryRevision,
+            predicate: {
+                await retainedTargetSatisfies(
+                    snapshotElement: target.snapshotElement, window: target.window.element,
+                    family: .setValue, intent: intent, before: before)
+            })
+    }
+    return try await stateResult(
+        app: app, windowTitle: windowTitle, windowID: target.window.lineageWindowID,
+        note: "Set the value of \(describeTarget(target)). Verify it below.",
+        screenshot: screenshotDetail(args),
+        focusTelemetry: focus.finish(deliveryTier: InputTier.accessibilityAttribute.rawValue),
+        verifier: verifier(intent: intent, tier: .accessibilityAttribute, dispatched: true)
+    )
+}
+
+// MARK: - select_text
+
+func selectTextImpl(_ args: [String: Value]) async throws -> CallTool.Result {
+    let app = try resolveApp(args.requireString("app"))
+    try requireAccessibilityTrusted()
+    let focus = FocusChangeTracker.start()
+    let target = try await resolveMutationTarget(app: app, elementID: args.requireString("element_id"))
+    let verifyEffect = args.bool("include_state") != false
+    let deliveryObserver = verifyEffect ? AXDeliveryObserver(
+        pid: app.pid, application: app.axApplication, window: target.window.element,
+        target: target.element, family: .setValue) : nil
+    let deliveryRevision = deliveryObserver?.revision
+    let text = try args.requireString("text")
+    let occurrence = max(1, args.integer("occurrence") ?? 1)
+
+    guard let value = axString(target.element, kAXValueAttribute) else {
+        throw ToolError.failed("\(describeTarget(target)) has no text value to select within.")
+    }
+
+    let nsValue = value as NSString
+    var searchStart = 0
+    var found = NSRange(location: NSNotFound, length: 0)
+    for _ in 0..<occurrence {
+        found = nsValue.range(
+            of: text, options: [], range: NSRange(location: searchStart, length: nsValue.length - searchStart)
+        )
+        guard found.location != NSNotFound else { break }
+        searchStart = found.location + 1
+    }
+    guard found.location != NSNotFound else {
+        throw ToolError.failed(
+            "\"\(text)\" (occurrence \(occurrence)) was not found in \(describeTarget(target)). "
+                + "Provide the text exactly as it appears in the element's value."
+        )
+    }
+
+    // position: select the match (default), or collapse the caret to one end —
+    // for inserting text before/after a landmark with type_text.
+    let position = args.string("position") ?? "select"
+    var range: CFRange
+    let note: String
+    switch position {
+    case "select":
+        range = CFRange(location: found.location, length: found.length)
+        note = "Selected \"\(text)\" in \(describeTarget(target))."
+    case "before":
+        range = CFRange(location: found.location, length: 0)
+        note = "Placed the cursor before \"\(text)\" in \(describeTarget(target))."
+    case "after":
+        range = CFRange(location: found.location + found.length, length: 0)
+        note = "Placed the cursor after \"\(text)\" in \(describeTarget(target))."
+    default:
+        throw ToolError.invalidArguments("position must be select, before, or after.")
+    }
+    try checkCancellationBeforeDelivery()
+    guard let rangeValue = AXValueCreate(.cfRange, &range),
+        AXUIElementSetAttributeValue(target.element, kAXSelectedTextRangeAttribute as CFString, rangeValue)
+            == .success
+    else {
+        throw ToolError.failed("\(describeTarget(target)) did not accept the text selection.")
+    }
+    if verifyEffect {
+        await waitForDeliveryVerification(
+            observer: deliveryObserver, baselineRevision: deliveryRevision,
+            predicate: {
+                guard let observed = selectedTextRange(of: target.element) else { return false }
+                return observed.location == range.location && observed.length == range.length
+            })
+    }
+    return try await stateResult(
+        app: app, windowTitle: target.snapshot.windowTitle,
+        windowID: target.window.lineageWindowID,
+        note: note,
+        screenshot: screenshotDetail(args),
+        focusTelemetry: focus.finish(deliveryTier: InputTier.accessibilityAttribute.rawValue)
+    )
+}
+
+private func selectedTextRange(of element: AXUIElement) -> CFRange? {
+    guard let raw = axAttribute(element, kAXSelectedTextRangeAttribute),
+        CFGetTypeID(raw) == AXValueGetTypeID()
+    else { return nil }
+    var range = CFRange()
+    guard AXValueGetValue(raw as! AXValue, .cfRange, &range) else { return nil }
+    return range
+}
+
+// MARK: - perform_secondary_action
+
+func performSecondaryActionImpl(_ args: [String: Value]) async throws -> CallTool.Result {
+    let app = try resolveApp(args.requireString("app"))
+    try requireAccessibilityTrusted()
+    let confirmed = SafetyPolicy.confirmed(args)
+    try SafetyPolicy.check(app: app, confirmed: confirmed)
+    let focus = FocusChangeTracker.start()
+    let target = try await resolveMutationTarget(app: app, elementID: args.requireString("element_id"))
+    let action = args.string("action") ?? "AXShowMenu"
+
+    let available = axActionNames(target.element)
+    guard available.contains(action) else {
+        throw ToolError.failed(
+            "\(describeTarget(target)) does not support \(action). "
+                + "Available actions: \(available.joined(separator: ", "))."
+        )
+    }
+    // Activating actions can be destructive (e.g. AXPress on a Delete button);
+    // gate them like a click. Menu/stepper actions stay ungated.
+    let activatingActions: Set<String> = [
+        kAXPressAction as String, "AXConfirm", "AXPick", "AXOpen",
+    ]
+    if activatingActions.contains(action) {
+        try SafetyPolicy.checkClick(label: clickableLabel(target.element), app: app, confirmed: confirmed)
+    }
+    let family: ActionFamily = action == "AXShowMenu" ? .menu : .secondaryAction
+    let intent: ActionIntent
+    switch action {
+    case "AXIncrement": intent = .incrementNumber
+    case "AXDecrement": intent = .decrementNumber
+    case "AXShowMenu": intent = .openMenu
+    default: intent = .activate
+    }
+    let verifyEffect = args.bool("include_state") != false
+    let deliveryObserver = verifyEffect ? AXDeliveryObserver(
+        pid: app.pid, application: app.axApplication, window: target.window.element,
+        target: target.element, family: family) : nil
+    let deliveryRevision = deliveryObserver?.revision
+    let before = ActionVerifier.captureBefore(
+        target.element, family: family, snapshotElement: target.snapshotElement)
+    try performAXAction(action, on: target)
+    let predicate: (() async -> Bool)?
+    if intent == .incrementNumber || intent == .decrementNumber {
+        predicate = {
+            await retainedTargetSatisfies(
+                snapshotElement: target.snapshotElement, window: target.window.element,
+                family: family, intent: intent, before: before)
+        }
+    } else {
+        predicate = nil
+    }
+    if verifyEffect {
+        await waitForDeliveryVerification(
+            observer: deliveryObserver, baselineRevision: deliveryRevision,
+            predicate: predicate)
+    }
+    // Secondary actions are usually menu-shaped: success when the tree changes
+    // (a context menu appeared), verifier_ambiguous when nothing observable
+    // followed — menu state is frequently unreadable via accessibility.
+    let verifier = ActionVerifier(
+        family: family, intent: intent, deliveryTier: InputTier.accessibilityAction.rawValue,
+        dispatchSucceeded: true, hasTargetElement: family.readsTargetFields,
+        snapshotElement: family.readsTargetFields ? target.snapshotElement : nil,
+        before: before,
+        beforeWindowTitle: target.snapshot.windowTitle)
+    return try await stateResult(
+        app: app, windowTitle: target.snapshot.windowTitle,
+        windowID: target.window.lineageWindowID,
+        note: "Performed \(action) on \(describeTarget(target)).",
+        screenshot: screenshotDetail(args),
+        focusTelemetry: focus.finish(deliveryTier: InputTier.accessibilityAction.rawValue),
+        verifier: verifier
+    )
+}
