@@ -24,6 +24,7 @@ let mutatingToolNames: Set<String> = [
     "click", "type_text", "press_key", "scroll", "drag", "set_value",
     "select_text", "perform_secondary_action", "open_app", "open_url",
     "background_type_text_strict",
+    "background_focus_field_strict",
     "manage_window", "write_clipboard",
 ]
 
@@ -35,6 +36,7 @@ let appScopedToolNames: Set<String> = [
     "click", "type_text", "press_key", "scroll", "drag", "set_value",
     "select_text", "perform_secondary_action", "manage_window",
     "background_type_text_strict",
+    "background_focus_field_strict",
 ]
 
 func isMutatingTool(_ name: String) -> Bool {

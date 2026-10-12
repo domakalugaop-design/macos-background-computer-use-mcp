@@ -19,7 +19,7 @@ test("stdio MCP exposes only the sanitized tools and rejects unsafe calls before
   const fixture = join(directory, "mock-upstream.mjs");
   await writeFile(fixture, `#!/usr/bin/env node
 let buffer = "";
-const names = ["list_apps","list_windows","get_app_state","click","type_text","press_key","scroll","drag","set_value","select_text","perform_secondary_action","open_app","open_url","manage_window","read_clipboard","write_clipboard","health_report","background_type_text_strict"];
+const names = ["list_apps","list_windows","get_app_state","click","type_text","press_key","scroll","drag","set_value","select_text","perform_secondary_action","open_app","open_url","manage_window","read_clipboard","write_clipboard","health_report","background_type_text_strict","background_focus_field_strict"];
 for await (const chunk of process.stdin) {
   buffer += chunk.toString();
   let newline;
@@ -49,7 +49,7 @@ for await (const chunk of process.stdin) {
     await client.connect(clientTransport);
     const tools = await client.listTools();
     assert.deepEqual(tools.tools.map((tool) => tool.name).sort(), [
-      "background_type_text_strict", "click", "get_app_state", "health_report", "list_apps", "list_windows", "set_value",
+      "background_focus_field_strict", "background_type_text_strict", "click", "get_app_state", "health_report", "list_apps", "list_windows", "set_value",
     ]);
     const clickTool = tools.tools.find((tool) => tool.name === "click");
     assert.ok(clickTool);

@@ -5,7 +5,7 @@ import { SAFE_TOOLS, sanitizeToolSchema, upstreamArguments, validateToolArgument
 
 test("only inspection, AXPress, bounded AX value setting, and non-probing health are allowlisted", () => {
   assert.deepEqual([...SAFE_TOOLS].sort(), [
-    "background_type_text_strict", "click", "get_app_state", "health_report", "list_apps", "list_windows", "set_value",
+    "background_focus_field_strict", "background_type_text_strict", "click", "get_app_state", "health_report", "list_apps", "list_windows", "set_value",
   ]);
 });
 
