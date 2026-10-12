@@ -221,7 +221,7 @@ export class BackgroundComputerUseAdapter {
   async listTools(): Promise<Tool[]> {
     const result = await this.callUpstream("tools/list") as { tools: Tool[] };
     const strictResult = await this.callStrictUpstream("tools/list") as { tools: Tool[] };
-    const strictOnly = strictResult.tools.filter((tool) => tool.name === "background_type_text_strict");
+    const strictOnly = strictResult.tools.filter((tool) => ["background_type_text_strict", "background_focus_field_strict"].includes(tool.name));
     const seen = new Set<string>();
     return [...result.tools, ...strictOnly].filter((tool) => {
       if (seen.has(tool.name)) return false;
@@ -239,7 +239,8 @@ export class BackgroundComputerUseAdapter {
       const code = SAFE_TOOLS.has(name) ? ErrorCode.InvalidParams : ErrorCode.MethodNotFound;
       throw new McpError(code, validation.error);
     }
-    const target = name === "background_type_text_strict" ? this.callStrictUpstream.bind(this) : this.callUpstream.bind(this);
+    const target = ["background_type_text_strict", "background_focus_field_strict"].includes(name)
+      ? this.callStrictUpstream.bind(this) : this.callUpstream.bind(this);
     return target("tools/call", {
       name,
       arguments: upstreamArguments(name, validation.args ?? {}),
