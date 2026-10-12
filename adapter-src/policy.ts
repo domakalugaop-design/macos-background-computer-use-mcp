@@ -8,6 +8,7 @@ export const SAFE_TOOLS = new Set([
   "set_value",
   "health_report",
   "background_type_text_strict",
+  "background_focus_field_strict",
 ]);
 
 export const TOOL_ALLOWED_PARAMS: Record<string, Set<string>> = {
@@ -18,6 +19,7 @@ export const TOOL_ALLOWED_PARAMS: Record<string, Set<string>> = {
   set_value: new Set(["app", "element_id", "value"]),
   health_report: new Set(),
   background_type_text_strict: new Set(["app", "target_pid", "element_id", "text", "confirm"]),
+  background_focus_field_strict: new Set(["app", "target_pid", "element_id", "ax_identifier", "confirm"]),
 };
 
 const TOOL_REQUIRED_PARAMS: Record<string, Set<string>> = {
@@ -28,6 +30,7 @@ const TOOL_REQUIRED_PARAMS: Record<string, Set<string>> = {
   set_value: new Set(["app", "element_id", "value"]),
   health_report: new Set(),
   background_type_text_strict: new Set(["app", "target_pid", "element_id", "text"]),
+  background_focus_field_strict: new Set(["app", "target_pid", "element_id", "ax_identifier"]),
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -89,7 +92,7 @@ export function validateToolArguments(
     return { error: "max_elements must be an integer from 1 to 5000." };
   }
   if (value.skeleton !== undefined && typeof value.skeleton !== "boolean") return { error: "skeleton must be a boolean." };
-  if (name === "click" || name === "set_value" || name === "background_type_text_strict") {
+  if (name === "click" || name === "set_value" || name === "background_type_text_strict" || name === "background_focus_field_strict") {
     if (typeof value.element_id !== "string" || !/^e(?:0|[1-9][0-9]*)@s[1-9][0-9]*$/.test(value.element_id)) {
       return { error: "element_id must be a current accessibility id such as e12@s3." };
     }
@@ -100,6 +103,17 @@ export function validateToolArguments(
     }
     if (typeof value.text !== "string" || value.text.length === 0 || value.text.length > 80) {
       return { error: "text must be a non-empty string of at most 80 characters." };
+    }
+    if (value.confirm !== undefined && typeof value.confirm !== "boolean") {
+      return { error: "confirm must be boolean when provided." };
+    }
+  }
+  if (name === "background_focus_field_strict") {
+    if (typeof value.target_pid !== "number" || !Number.isInteger(value.target_pid) || value.target_pid < 1) {
+      return { error: "target_pid must be a positive integer." };
+    }
+    if (typeof value.ax_identifier !== "string" || value.ax_identifier.length === 0 || value.ax_identifier.length > 256) {
+      return { error: "ax_identifier must be a non-empty string of at most 256 characters." };
     }
     if (value.confirm !== undefined && typeof value.confirm !== "boolean") {
       return { error: "confirm must be boolean when provided." };
@@ -126,6 +140,8 @@ export function upstreamArguments(name: string, args: Record<string, unknown>): 
       return { probe_capture_service: false };
     case "background_type_text_strict":
       return { app: args.app, target_pid: args.target_pid, element_id: args.element_id, text: args.text, ...(args.confirm === undefined ? {} : { confirm: args.confirm }) };
+    case "background_focus_field_strict":
+      return { app: args.app, target_pid: args.target_pid, element_id: args.element_id, ax_identifier: args.ax_identifier, ...(args.confirm === undefined ? {} : { confirm: args.confirm }) };
     default:
       return args;
   }
